@@ -1,4 +1,5 @@
 #!/bin/bash
+cd /home/gdaniel1979/hobby_projects/drive_sync
 LOG_FILE="/home/gdaniel1979/hobby_projects/drive_sync/drive_sync.log"
 TEMP_FILE=$(mktemp)
 
