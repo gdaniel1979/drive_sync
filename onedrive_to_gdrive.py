@@ -63,21 +63,19 @@ def get_ms_token():
         result = app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
         if result and "access_token" in result:
             save_ms_cache(cache)
-            # print("✅ Microsoft token loaded (from cache, no login required).")
+            # print("✅ Microsoft token loaded from cache.")
             return result["access_token"]
-
-    # Cache empty or expired → interactive login
+        else:
+            print("⚠️ Token silent refresh failed, clearing cache.")
+            open(MS_TOKEN_CACHE_FILE, "w").close()
     flow = app.initiate_device_flow(scopes=GRAPH_SCOPES)
     if "error" in flow:
         raise Exception(f"Device flow error: {flow.get('error')}: {flow.get('error_description')}")
-
     print("\n🔑 MICROSOFT LOGIN (only required the first time):")
     print(flow["message"])
     result = app.acquire_token_by_device_flow(flow)
-
     if "access_token" not in result:
         raise Exception(f"Microsoft authentication failed: {result.get('error_description')}")
-
     save_ms_cache(cache)
     print("✅ Microsoft authentication successful. Token saved to cache.")
     return result["access_token"]
@@ -204,7 +202,7 @@ def upload_to_gdrive(service, filename, content, parent_id):
 
     
 # ============================================================
-# MAIN LOGIC
+# MAIN
 # ============================================================
 
 def main():
@@ -235,4 +233,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
