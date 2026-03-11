@@ -22,7 +22,8 @@ from datetime import datetime
 from config import (
     MS_CLIENT_ID, MS_TENANT_ID, MS_TOKEN_CACHE_FILE, 
     GOOGLE_CREDENTIALS_FILE, GOOGLE_TOKEN_FILE, 
-    ONEDRIVE_FILES, GDRIVE_TARGET_FOLDER
+    ONEDRIVE_FILES, GDRIVE_TARGET_FOLDER,
+    BREVO_API_KEY, EMAIL_SENDER, EMAIL_SENDER_NAME, EMAIL_RECEIVER
 )
 
 # ============================================================
@@ -113,7 +114,7 @@ def get_gdrive_service():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            print("✅ Google token renewed.")
+            # print("✅ Google token renewed.")
         else:
             flow = InstalledAppFlow.from_client_secrets_file(
                 GOOGLE_CREDENTIALS_FILE, GDRIVE_SCOPES
@@ -200,36 +201,76 @@ def upload_to_gdrive(service, filename, content, parent_id):
         service.files().create(body=meta, media_body=media, fields="id").execute()
         # print(f"  ✅ Uploaded: {clean_filename}")
 
-    
+def send_error_email(failed_files, error_msg=None):
+    """Hibaértesítő email küldése Brevo API-n keresztül."""
+
+    if error_msg:
+        subject = "❌ drive_sync – critical error"
+        body    = f"The drive_sync script crashed with the following error:\n\n{error_msg}"
+    else:
+        subject = "❌ drive_sync – upload failed"
+        body    = "The following files failed to upload:\n\n" + "\n".join(failed_files)
+
+    payload = {
+        "sender":   {"name": EMAIL_SENDER_NAME, "email": EMAIL_SENDER},
+        "to":       [{"email": EMAIL_RECEIVER}],
+        "subject":  subject,
+        "textContent": body
+    }
+
+    response = requests.post(
+        "https://api.brevo.com/v3/smtp/email",
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json"
+        },
+        json=payload
+    )
+
+    if response.status_code != 201:
+        print(f"⚠️ Email sending failed: {response.status_code} {response.text}")
+   
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    ms_token   = get_ms_token()
-    gdrive_svc = get_gdrive_service()
+    try:
+        ms_token   = get_ms_token()
+        gdrive_svc = get_gdrive_service()
 
-    parent_id = None
-    if GDRIVE_TARGET_FOLDER:
-        parent_id = find_gdrive_folder_id(gdrive_svc, GDRIVE_TARGET_FOLDER)
-        if not parent_id:
-            parent_id = create_gdrive_folder(gdrive_svc, GDRIVE_TARGET_FOLDER)
+        parent_id = None
+        if GDRIVE_TARGET_FOLDER:
+            parent_id = find_gdrive_folder_id(gdrive_svc, GDRIVE_TARGET_FOLDER)
+            if not parent_id:
+                parent_id = create_gdrive_folder(gdrive_svc, GDRIVE_TARGET_FOLDER)
 
-    success_files, failed_files = [], []
+        success_files, failed_files = [], []
 
-    for path in ONEDRIVE_FILES:
-        filename = path.replace("\\", "/").split("/")[-1]
-        try:
-            content = download_onedrive_file(ms_token, path)
-            upload_to_gdrive(gdrive_svc, filename, content, parent_id)
-            success_files.append(filename)
-        except Exception as e:
-            failed_files.append(f"{filename} ({e})")
+        for path in ONEDRIVE_FILES:
+            filename = path.replace("\\", "/").split("/")[-1]
+            try:
+                content = download_onedrive_file(ms_token, path)
+                upload_to_gdrive(gdrive_svc, filename, content, parent_id)
+                success_files.append(filename)
+            except Exception as e:
+                failed_files.append(f"{filename} ({e})")
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    success_str = ", ".join(success_files) if success_files else "–"
-    failed_str  = ", ".join(failed_files)  if failed_files  else "–"
-    print(f"{timestamp} | Successfully uploaded: {success_str} | Unsuccessful: {failed_str}")
+        timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        success_str = ", ".join(success_files) if success_files else "–"
+        failed_str  = ", ".join(failed_files)  if failed_files  else "–"
+        print("-" * 80)
+        print(f"{timestamp}")
+        print(f"✅ Successfully uploaded: {success_str} | Unsuccessful: {failed_str}")
+        print(f"❌ Unsuccessful: {failed_str}")
+        
+        if failed_files:
+            send_error_email(failed_files)
+
+    except Exception as e:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{timestamp} | CRITICAL ERROR: {e}")
+        send_error_email([], error_msg=str(e))
 
 if __name__ == "__main__":
     main()
