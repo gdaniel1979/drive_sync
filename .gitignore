@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Secrets / credentials
+config.py
+credentials.json
+service_account.json
+google_token.json
+ms_token_cache.json
+
+# Runtime data
+drive_sync.log
+last_modified_cache.json
+
+# Archived exploratory scripts (contain embedded secrets in notebook outputs)
+archive/

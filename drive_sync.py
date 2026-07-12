@@ -6,10 +6,12 @@ OneDrive → Google Drive file copy script
 - Google Drive access: Google Drive API (OAuth2, personal account)
 - If the file already exists on Google Drive: overwrite it
 - Microsoft token cache: no need to log in every time it runs
+- Skip upload if file hasn't changed since last run (lastModifiedDateTime)
 """
 
 import os
 import io
+import json
 import requests
 
 from google.oauth2.credentials import Credentials
@@ -20,11 +22,30 @@ from googleapiclient.http import MediaIoBaseUpload
 import msal
 from datetime import datetime
 from config import (
-    MS_CLIENT_ID, MS_TENANT_ID, MS_TOKEN_CACHE_FILE, 
-    GOOGLE_CREDENTIALS_FILE, GOOGLE_TOKEN_FILE, 
-    ONEDRIVE_FILES, GDRIVE_TARGET_FOLDER,
-    BREVO_API_KEY, EMAIL_SENDER, EMAIL_SENDER_NAME, EMAIL_RECEIVER
+    MS_CLIENT_ID, MS_TENANT_ID, MS_TOKEN_CACHE_FILE,                 # Microsoft auth
+    GOOGLE_CREDENTIALS_FILE, GOOGLE_TOKEN_FILE,                      # Google auth
+    ONEDRIVE_FILES, GDRIVE_TARGET_FOLDER,                            # Drives info
+    BREVO_API_KEY, EMAIL_SENDER, EMAIL_SENDER_NAME, EMAIL_RECEIVER   # E-mail sending info
 )
+
+# ============================================================
+# MODIFIED CACHE FILE – stores last known lastModifiedDateTime
+# per OneDrive file path
+# ============================================================
+
+MODIFIED_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_modified_cache.json")
+
+def load_modified_cache():
+    """Load the last known modification timestamps from local JSON cache."""
+    if os.path.exists(MODIFIED_CACHE_FILE):
+        with open(MODIFIED_CACHE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_modified_cache(cache):
+    """Save modification timestamps to local JSON cache."""
+    with open(MODIFIED_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
 
 # ============================================================
 # MICROSOFT GRAPH API – Authentication with token cache
@@ -58,13 +79,11 @@ def get_ms_token():
         token_cache=cache
     )
 
-    # Let's try to get a token from the cache
     accounts = app.get_accounts()
     if accounts:
         result = app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
         if result and "access_token" in result:
             save_ms_cache(cache)
-            # print("✅ Microsoft token loaded from cache.")
             return result["access_token"]
         else:
             print("⚠️ Token silent refresh failed, clearing cache.")
@@ -72,7 +91,7 @@ def get_ms_token():
     flow = app.initiate_device_flow(scopes=GRAPH_SCOPES)
     if "error" in flow:
         raise Exception(f"Device flow error: {flow.get('error')}: {flow.get('error_description')}")
-    print("\n🔑 MICROSOFT LOGIN (only required the first time):")
+    print("🔑 MICROSOFT LOGIN (only required the first time):")
     print(flow["message"])
     result = app.acquire_token_by_device_flow(flow)
     if "access_token" not in result:
@@ -80,6 +99,22 @@ def get_ms_token():
     save_ms_cache(cache)
     print("✅ Microsoft authentication successful. Token saved to cache.")
     return result["access_token"]
+
+def get_onedrive_file_metadata(token, onedrive_path):
+    """Fetches file metadata from OneDrive, returns lastModifiedDateTime string."""
+    headers = {"Authorization": f"Bearer {token}"}
+    normalized = onedrive_path.replace("\\", "/")
+    encoded = requests.utils.quote(normalized, safe="/")
+    url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{encoded}"
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        data = response.json()
+        return data.get("lastModifiedDateTime")
+    elif response.status_code == 404:
+        raise FileNotFoundError(f"Not found on OneDrive: {onedrive_path}")
+    else:
+        raise Exception(f"OneDrive metadata error ({response.status_code}): {response.text}")
 
 def download_onedrive_file(token, onedrive_path):
     """Downloads a file from OneDrive in bytes format."""
@@ -90,7 +125,6 @@ def download_onedrive_file(token, onedrive_path):
     response = requests.get(url, headers=headers)
 
     if response.status_code == 200:
-        # print(f"  📥 Downloaded from OneDrive: {onedrive_path}")
         return response.content
     elif response.status_code == 404:
         raise FileNotFoundError(f"Not found on OneDrive: {onedrive_path}")
@@ -107,30 +141,15 @@ GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 def get_gdrive_service():
     """Creating a Google Drive API service with OAuth2."""
     creds = None
-
     if os.path.exists(GOOGLE_TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(GOOGLE_TOKEN_FILE, GDRIVE_SCOPES)
-
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            # print("✅ Google token renewed.")
+            with open(GOOGLE_TOKEN_FILE, "w") as f:
+                f.write(creds.to_json())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                GOOGLE_CREDENTIALS_FILE, GDRIVE_SCOPES
-            )
-            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-            auth_url, _ = flow.authorization_url(prompt="consent")
-            print("\n🔑 GOOGLE LOGIN (only required the first time):")
-            print(f"Nyisd meg ezt a linket a böngészőben:\n{auth_url}")
-            code = input("\nThen paste the code you received here: ")
-            flow.fetch_token(code=code)
-            creds = flow.credentials
-            print("✅ Google authentication successful. Token saved.")
-
-        with open(GOOGLE_TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
-
+            raise Exception("Google token missing or invalid. Regenerate google_token.json.")
     return build("drive", "v3", credentials=creds)
 
 def find_gdrive_folder_id(service, folder_name):
@@ -172,7 +191,6 @@ def upload_to_gdrive(service, filename, content, parent_id):
     if not mime_type:
         mime_type = "application/octet-stream"
 
-    # Find all existing files with the same name
     safe_filename = clean_filename.replace("'", "\\'")
     if parent_id:
         query = f"name='{safe_filename}' and '{parent_id}' in parents and trashed=false"
@@ -184,22 +202,17 @@ def upload_to_gdrive(service, filename, content, parent_id):
     media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=True)
 
     if existing_ids:
-        # Overwriting the first copy
         service.files().update(
             fileId=existing_ids[0],
             media_body=media
         ).execute()
-        # print(f"  ♻️  Overwritten: {clean_filename}")
-        # Delete other duplicates
         for dup_id in existing_ids[1:]:
             service.files().delete(fileId=dup_id).execute()
-            # print(f"  🗑️  Duplicate deleted: {clean_filename}")
     else:
         meta = {"name": clean_filename}
         if parent_id:
             meta["parents"] = [parent_id]
         service.files().create(body=meta, media_body=media, fields="id").execute()
-        # print(f"  ✅ Uploaded: {clean_filename}")
 
 def send_error_email(failed_files, error_msg=None):
     """Hibaértesítő email küldése Brevo API-n keresztül."""
@@ -245,31 +258,43 @@ def main():
             if not parent_id:
                 parent_id = create_gdrive_folder(gdrive_svc, GDRIVE_TARGET_FOLDER)
 
-        success_files, failed_files = [], []
+        modified_cache = load_modified_cache()
+        success_files, failed_files, skipped_files = [], [], []
 
         for path in ONEDRIVE_FILES:
             filename = path.replace("\\", "/").split("/")[-1]
             try:
+                last_modified = get_onedrive_file_metadata(ms_token, path)
+                cached_modified = modified_cache.get(path)
+
+                if last_modified and last_modified == cached_modified:
+                    skipped_files.append(filename)
+                    continue
+
                 content = download_onedrive_file(ms_token, path)
                 upload_to_gdrive(gdrive_svc, filename, content, parent_id)
+                modified_cache[path] = last_modified
                 success_files.append(filename)
+
             except Exception as e:
                 failed_files.append(f"{filename} ({e})")
 
-        timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_modified_cache(modified_cache)
+
+        timestamp   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         success_str = ", ".join(success_files) if success_files else "–"
         failed_str  = ", ".join(failed_files)  if failed_files  else "–"
-        print("-" * 80)
-        print(f"{timestamp}")
-        print(f"✅ Successfully uploaded: {success_str} | Unsuccessful: {failed_str}")
-        print(f"❌ Unsuccessful: {failed_str}")
-        
+        skipped_str = ", ".join(skipped_files) if skipped_files else "–"
+                               
         if failed_files:
+            print(f"{timestamp} | ❌ Failed: {failed_str} | ✅ Uploaded: {success_str} | ⏭️ Skipped: {skipped_str}")
             send_error_email(failed_files)
-
+        else:
+            print(f"{timestamp} | ✅ Uploaded: {success_str} | ❌ Failed: {failed_str} | ⏭️ Skipped: {skipped_str}")
+    
     except Exception as e:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"{timestamp} | CRITICAL ERROR: {e}")
+        print(f"{timestamp} | ⚠️ CRITICAL ERROR: {e}")
         send_error_email([], error_msg=str(e))
 
 if __name__ == "__main__":
