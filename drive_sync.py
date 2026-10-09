@@ -7,11 +7,16 @@ OneDrive → Google Drive file copy script
 - If the file already exists on Google Drive: overwrite it
 - Microsoft token cache: no need to log in every time it runs
 - Skip upload if file hasn't changed since last run (lastModifiedDateTime)
+  and it is still present on Google Drive
+- Exit code is 1 if any file failed or the script crashed, 0 otherwise
 """
 
 import os
 import io
+import sys
 import json
+import socket
+import mimetypes
 import requests
 
 from google.oauth2.credentials import Credentials
@@ -27,6 +32,12 @@ from config import (
     ONEDRIVE_FILES, GDRIVE_TARGET_FOLDER,                            # Drives info
     BREVO_API_KEY, EMAIL_SENDER, EMAIL_SENDER_NAME, EMAIL_RECEIVER   # E-mail sending info
 )
+
+# (connect, read) timeouts in seconds for every HTTP call, so a stalled
+# connection can't block the run forever.
+REQUEST_TIMEOUT = (10, 120)
+# The Google API client (httplib2) falls back to the default socket timeout.
+socket.setdefaulttimeout(120)
 
 # ============================================================
 # MODIFIED CACHE FILE – stores last known lastModifiedDateTime
@@ -53,6 +64,11 @@ def save_modified_cache(cache):
 
 GRAPH_SCOPES = ["https://graph.microsoft.com/Files.Read"]
 
+# Errors from acquire_token_silent that mean the refresh token is gone or
+# unusable and the user has to sign in again. Anything else (network,
+# server hiccup) is transient and must not throw the cache away.
+LOGIN_REQUIRED_ERRORS = {"invalid_grant", "interaction_required", "consent_required", "login_required"}
+
 def load_ms_cache():
     """ Loading Microsoft token cache from file."""
     cache = msal.SerializableTokenCache()
@@ -67,17 +83,21 @@ def save_ms_cache(cache):
         with open(MS_TOKEN_CACHE_FILE, "w") as f:
             f.write(cache.serialize())
 
-def get_ms_token():
-    """
-    Retrieve Microsoft token from cache or interactive login.
-    Login required on first run, then automatic.
-    """
-    cache = load_ms_cache()
-    app = msal.PublicClientApplication(
+def build_ms_app(cache):
+    return msal.PublicClientApplication(
         MS_CLIENT_ID,
         authority=f"https://login.microsoftonline.com/{MS_TENANT_ID}",
         token_cache=cache
     )
+
+def get_ms_token():
+    """
+    Retrieve Microsoft token from cache or interactive login.
+    Login required on first run, then automatic. When there is no terminal
+    (cron), a missing login raises instead of waiting for the device flow.
+    """
+    cache = load_ms_cache()
+    app = build_ms_app(cache)
 
     accounts = app.get_accounts()
     if accounts:
@@ -85,9 +105,21 @@ def get_ms_token():
         if result and "access_token" in result:
             save_ms_cache(cache)
             return result["access_token"]
-        else:
-            print("⚠️ Token silent refresh failed, clearing cache.")
-            open(MS_TOKEN_CACHE_FILE, "w").close()
+        error = (result or {}).get("error")
+        if result and error not in LOGIN_REQUIRED_ERRORS:
+            # Transient failure: keep the cache, retry on the next run.
+            raise Exception(f"Microsoft silent token refresh failed: {error}: {result.get('error_description')}")
+
+    if not sys.stdin.isatty():
+        raise Exception(
+            "Microsoft login required. Run `python3 drive_sync.py` from a terminal "
+            "to sign in again."
+        )
+
+    if accounts:
+        print("⚠️ Token silent refresh failed, clearing cache.")
+        cache = msal.SerializableTokenCache()
+        app = build_ms_app(cache)
     flow = app.initiate_device_flow(scopes=GRAPH_SCOPES)
     if "error" in flow:
         raise Exception(f"Device flow error: {flow.get('error')}: {flow.get('error_description')}")
@@ -106,7 +138,7 @@ def get_onedrive_file_metadata(token, onedrive_path):
     normalized = onedrive_path.replace("\\", "/")
     encoded = requests.utils.quote(normalized, safe="/")
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{encoded}"
-    response = requests.get(url, headers=headers)
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
 
     if response.status_code == 200:
         data = response.json()
@@ -122,7 +154,7 @@ def download_onedrive_file(token, onedrive_path):
     normalized = onedrive_path.replace("\\", "/")
     encoded = requests.utils.quote(normalized, safe="/")
     url = f"https://graph.microsoft.com/v1.0/me/drive/root:/{encoded}:/content"
-    response = requests.get(url, headers=headers)
+    response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
 
     if response.status_code == 200:
         return response.content
@@ -173,31 +205,32 @@ def create_gdrive_folder(service, folder_name):
     print(f"  📁 Folder created on Google Drive: {folder_name}")
     return folder["id"]
 
-def find_all_existing_files(service, filename, parent_id):
-    clean_filename = filename.replace("\\", "/").split("/")[-1]
-    safe_filename = clean_filename.replace("'", "\\'")
-    if parent_id:
-        query = f"name='{safe_filename}' and '{parent_id}' in parents and trashed=false"
-    else:
-        query = f"name='{safe_filename}' and 'root' in parents and trashed=false"
-    result = service.files().list(q=query, fields="files(id, name)").execute()
-    return [f["id"] for f in result.get("files", [])]
+def list_gdrive_files(service, parent_id):
+    """Returns {file name: [file ids]} for the (non-folder) files in the target folder."""
+    query = (
+        f"'{parent_id or 'root'}' in parents and trashed=false "
+        f"and mimeType!='application/vnd.google-apps.folder'"
+    )
+    files = {}
+    page_token = None
+    while True:
+        result = service.files().list(
+            q=query, fields="nextPageToken, files(id, name)",
+            pageSize=1000, pageToken=page_token
+        ).execute()
+        for f in result.get("files", []):
+            files.setdefault(f["name"], []).append(f["id"])
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            return files
 
-def upload_to_gdrive(service, filename, content, parent_id):
-    import mimetypes
+def upload_to_gdrive(service, filename, content, parent_id, existing_ids):
+    """Overwrites the existing Drive file (and removes duplicates) or creates a new one."""
     clean_filename = filename.replace("\\", "/").split("/")[-1]
 
     mime_type, _ = mimetypes.guess_type(clean_filename)
     if not mime_type:
         mime_type = "application/octet-stream"
-
-    safe_filename = clean_filename.replace("'", "\\'")
-    if parent_id:
-        query = f"name='{safe_filename}' and '{parent_id}' in parents and trashed=false"
-    else:
-        query = f"name='{safe_filename}' and 'root' in parents and trashed=false"
-    result = service.files().list(q=query, fields="files(id, name)").execute()
-    existing_ids = [f["id"] for f in result.get("files", [])]
 
     media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=True)
 
@@ -215,7 +248,7 @@ def upload_to_gdrive(service, filename, content, parent_id):
         service.files().create(body=meta, media_body=media, fields="id").execute()
 
 def send_error_email(failed_files, error_msg=None):
-    """Hibaértesítő email küldése Brevo API-n keresztül."""
+    """Send an error notification email via the Brevo API. Never raises."""
 
     if error_msg:
         subject = "❌ drive_sync – critical error"
@@ -231,23 +264,29 @@ def send_error_email(failed_files, error_msg=None):
         "textContent": body
     }
 
-    response = requests.post(
-        "https://api.brevo.com/v3/smtp/email",
-        headers={
-            "api-key": BREVO_API_KEY,
-            "Content-Type": "application/json"
-        },
-        json=payload
-    )
+    try:
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "api-key": BREVO_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=REQUEST_TIMEOUT
+        )
+    except requests.RequestException as e:
+        print(f"⚠️ Email sending failed: {e}")
+        return
 
     if response.status_code != 201:
         print(f"⚠️ Email sending failed: {response.status_code} {response.text}")
-   
+
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
+    """Runs the sync. Returns the process exit code (0 = OK, 1 = any failure)."""
     try:
         ms_token   = get_ms_token()
         gdrive_svc = get_gdrive_service()
@@ -258,6 +297,7 @@ def main():
             if not parent_id:
                 parent_id = create_gdrive_folder(gdrive_svc, GDRIVE_TARGET_FOLDER)
 
+        existing_files = list_gdrive_files(gdrive_svc, parent_id)
         modified_cache = load_modified_cache()
         success_files, failed_files, skipped_files = [], [], []
 
@@ -267,12 +307,13 @@ def main():
                 last_modified = get_onedrive_file_metadata(ms_token, path)
                 cached_modified = modified_cache.get(path)
 
-                if last_modified and last_modified == cached_modified:
+                # Unchanged on OneDrive AND still present on Google Drive
+                if last_modified and last_modified == cached_modified and filename in existing_files:
                     skipped_files.append(filename)
                     continue
 
                 content = download_onedrive_file(ms_token, path)
-                upload_to_gdrive(gdrive_svc, filename, content, parent_id)
+                upload_to_gdrive(gdrive_svc, filename, content, parent_id, existing_files.get(filename, []))
                 modified_cache[path] = last_modified
                 success_files.append(filename)
 
@@ -285,17 +326,19 @@ def main():
         success_str = ", ".join(success_files) if success_files else "–"
         failed_str  = ", ".join(failed_files)  if failed_files  else "–"
         skipped_str = ", ".join(skipped_files) if skipped_files else "–"
-                               
+
         if failed_files:
             print(f"{timestamp} | ❌ Failed: {failed_str} | ✅ Uploaded: {success_str} | ⏭️ Skipped: {skipped_str}")
             send_error_email(failed_files)
-        else:
-            print(f"{timestamp} | ✅ Uploaded: {success_str} | ❌ Failed: {failed_str} | ⏭️ Skipped: {skipped_str}")
-    
+            return 1
+        print(f"{timestamp} | ✅ Uploaded: {success_str} | ❌ Failed: {failed_str} | ⏭️ Skipped: {skipped_str}")
+        return 0
+
     except Exception as e:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"{timestamp} | ⚠️ CRITICAL ERROR: {e}")
         send_error_email([], error_msg=str(e))
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
