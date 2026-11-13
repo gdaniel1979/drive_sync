@@ -13,8 +13,10 @@ OneDrive → Google Drive file copy script
 
 import os
 import io
+import re
 import sys
 import json
+import html
 import socket
 import mimetypes
 import requests
@@ -132,6 +134,23 @@ def get_ms_token():
     print("✅ Microsoft authentication successful. Token saved to cache.")
     return result["access_token"]
 
+def error_text(response, limit=300):
+    """
+    One-line, readable error text from an HTTP response: the Graph error
+    message for JSON bodies, the visible text for HTML error pages.
+    """
+    try:
+        data = response.json()
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict) and err.get("message"):
+            return f"{err.get('code', '')}: {err['message']}".strip(": ")[:limit]
+    except ValueError:
+        pass
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", response.text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = " ".join(html.unescape(text).split())
+    return text[:limit] or "(empty response)"
+
 def get_onedrive_file_metadata(token, onedrive_path):
     """Fetches file metadata from OneDrive, returns lastModifiedDateTime string."""
     headers = {"Authorization": f"Bearer {token}"}
@@ -146,7 +165,7 @@ def get_onedrive_file_metadata(token, onedrive_path):
     elif response.status_code == 404:
         raise FileNotFoundError(f"Not found on OneDrive: {onedrive_path}")
     else:
-        raise Exception(f"OneDrive metadata error ({response.status_code}): {response.text}")
+        raise Exception(f"OneDrive metadata error ({response.status_code}): {error_text(response)}")
 
 def download_onedrive_file(token, onedrive_path):
     """Downloads a file from OneDrive in bytes format."""
@@ -161,7 +180,7 @@ def download_onedrive_file(token, onedrive_path):
     elif response.status_code == 404:
         raise FileNotFoundError(f"Not found on OneDrive: {onedrive_path}")
     else:
-        raise Exception(f"OneDrive download error ({response.status_code}): {response.text}")
+        raise Exception(f"OneDrive download error ({response.status_code}): {error_text(response)}")
 
 
 # ============================================================
