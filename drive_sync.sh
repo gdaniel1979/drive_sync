@@ -7,7 +7,8 @@ cd "$BASE_DIR"
 LOG_FILE="$BASE_DIR/drive_sync.log"
 TEMP_FILE=$(mktemp)
 
-/usr/bin/python3 "$BASE_DIR/drive_sync.py" > "$TEMP_FILE" 2>&1
+# a projekt saját Python-környezete (3.12, uv; 2026-11-25 óta, független a rendszer Pythonjától)
+/home/gdaniel1979/.venvs/drive-sync-py312/bin/python "$BASE_DIR/drive_sync.py" > "$TEMP_FILE" 2>&1
 STATUS=$?
 
 # Newest entries go on top; keep only the first MAX_LOG_LINES lines.
